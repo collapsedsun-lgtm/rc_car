@@ -522,8 +522,8 @@ void captureTask(void *pvParameters){
     int fps = target_fps > 0 ? target_fps : 1;
     unsigned long start = millis();
 
-    // only capture if at least one client connected and not reinitializing camera
-    if(webSocket.connectedClients() > 0 && !camera_reinit_in_progress){
+    // only capture if not reinitializing camera
+    if(!camera_reinit_in_progress){
       camera_fb_t * fb = esp_camera_fb_get();
       if(!fb){
         Serial.println("Camera capture failed");
@@ -536,7 +536,7 @@ void captureTask(void *pvParameters){
           consecutive_large_frames++;
           sensor_t * s = esp_camera_sensor_get();
           if(s && current_jpeg_quality > MIN_JPEG_QUALITY){
-            current_jpeg_quality = max(MIN_JPEG_QUALITY, current_jpeg_quality - 2);
+            current_jpeg_quality = max(MIN_JPEG_QUALITY, current_jpeg_quality - 1);
             Serial.printf("Adjusting JPEG quality down to %d\n", current_jpeg_quality);
             if(s->set_quality) s->set_quality(s, current_jpeg_quality);
           }
