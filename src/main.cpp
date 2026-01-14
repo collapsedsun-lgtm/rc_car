@@ -36,9 +36,9 @@ const char* password = "12345678";
 WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
-// Flow-control: per-client ready flags to avoid sending frames faster than client can handle
-#define MAX_WS_CLIENTS 6
-volatile bool client_ready[MAX_WS_CLIENTS] = {false};
+// Flow-control: single client ready flag to avoid sending frames faster than client can handle
+volatile bool client_ready = false;
+volatile uint8_t client_num = 255; // 255 = no client connected
 
 // Frame queue: captureTask pushes frames, main loop pops and sends via WebSocket
 // Since single-client constraint, use simple circular buffer to avoid heap allocations
@@ -86,7 +86,7 @@ camera_fb_t* popFrameFromQueue() {
   return fb;
 }
 
-// Per-client telemetry
+// Single client telemetry
 struct ClientInfo {
   bool connected = false;
   IPAddress ip = IPAddress((uint32_t)0);
@@ -107,7 +107,7 @@ struct ClientInfo {
   int sendFailures = 0;
   unsigned long backoffUntilMs = 0;
 };
-ClientInfo clientInfo[MAX_WS_CLIENTS];
+ClientInfo client;
 
 // Default settings
 volatile int target_fps = 15; // default fps
@@ -425,46 +425,46 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     doc["quality"] = current_jpeg_quality;
     String out; serializeJson(doc,out);
     webSocket.sendTXT(num, out);
-    if(num < MAX_WS_CLIENTS) {
-      client_ready[num] = true; // allow initial frame
-      clientInfo[num].connected = true;
-      clientInfo[num].ip = ip;
-      clientInfo[num].connectedAt = millis();
-      clientInfo[num].framesSent = 0;
-      clientInfo[num].lastFrameMs = 0;
-      clientInfo[num].lastFrameBytes = 0;
-      clientInfo[num].lastPongMs = millis();
-      // reset send counters so they don't accumulate across reconnects
-      clientInfo[num].sendAttempts = 0;
-      clientInfo[num].sendFailures = 0;
-      clientInfo[num].lastSendMs = 0;
-      clientInfo[num].pendingPrevFrameMs = 0;
-      clientInfo[num].backoffUntilMs = 0;
-    }
+    client_num = num;
+    client_ready = true; // allow initial frame
+    client.connected = true;
+    client.ip = ip;
+    client.connectedAt = millis();
+    client.framesSent = 0;
+    client.lastFrameMs = 0;
+    client.lastFrameBytes = 0;
+    client.lastPongMs = millis();
+    // reset send counters so they don't accumulate across reconnects
+    client.sendAttempts = 0;
+    client.sendFailures = 0;
+    client.lastSendMs = 0;
+    client.pendingPrevFrameMs = 0;
+    client.backoffUntilMs = 0;
     return;
   }
   if(type == WStype_DISCONNECTED){
     Serial.printf("Client %u disconnected\n", num);
-    if(num < MAX_WS_CLIENTS) {
-      client_ready[num] = false;
-      clientInfo[num].disconnects++;
-      clientInfo[num].connected = false;
+    if(num == client_num) {
+      client_ready = false;
+      client.disconnects++;
+      client.connected = false;
+      client_num = 255; // mark no client
       // print extended telemetry for this client to aid debugging
       Serial.printf("Client %u telemetry: framesSent=%d lastFrameBytes=%u lastFrameAgeMs=%lu disconnects=%d sendAttempts=%d sendFailures=%d avgRtt=%.1f lastRssi=%d lastSendMs=%lu lastPongMs=%lu\n",
         num,
-        clientInfo[num].framesSent,
-        (unsigned)clientInfo[num].lastFrameBytes,
-        (unsigned long)(millis() - clientInfo[num].lastFrameMs),
-        clientInfo[num].disconnects,
-        clientInfo[num].sendAttempts,
-        clientInfo[num].sendFailures,
-        clientInfo[num].avgRttMs,
-        clientInfo[num].lastRssi,
-        (unsigned long)clientInfo[num].lastSendMs,
-        (unsigned long)clientInfo[num].lastPongMs);
+        client.framesSent,
+        (unsigned)client.lastFrameBytes,
+        (unsigned long)(millis() - client.lastFrameMs),
+        client.disconnects,
+        client.sendAttempts,
+        client.sendFailures,
+        client.avgRttMs,
+        client.lastRssi,
+        (unsigned long)client.lastSendMs,
+        (unsigned long)client.lastPongMs);
       // clear transient send state on disconnect
-      clientInfo[num].lastSendMs = 0;
-      clientInfo[num].pendingPrevFrameMs = 0;
+      client.lastSendMs = 0;
+      client.pendingPrevFrameMs = 0;
     }
     return;
   }
@@ -478,38 +478,31 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     if(strcmp(t,"ctrl")==0){
       unsigned long now = millis();
       const unsigned long MIN_CTRL_INTERVAL_MS = 33; // ~30Hz
-      if(num < MAX_WS_CLIENTS){
-        if(now - clientInfo[num].lastCtrlMs >= MIN_CTRL_INTERVAL_MS){
-          int x = doc["x"] | ctrl_x;
-          int y = doc["y"] | ctrl_y;
-          ctrl_x = x; ctrl_y = y;
-          clientInfo[num].lastCtrlMs = now;
-        }
-      } else {
-        // fallback: accept ctrl if client index out of tracking range
+      if(num == client_num && now - client.lastCtrlMs >= MIN_CTRL_INTERVAL_MS){
         int x = doc["x"] | ctrl_x;
         int y = doc["y"] | ctrl_y;
         ctrl_x = x; ctrl_y = y;
+        client.lastCtrlMs = now;
       }
       // Avoid noisy serial prints and extra ack traffic — main loop already prints and client
       // gets immediate visual feedback. This reduces heap/I/O pressure that can cause crashes.
       return;
     }
     if(strcmp(t,"pong")==0){
-      if(num < MAX_WS_CLIENTS){
+      if(num == client_num){
         unsigned long sentTs = doc["ts"] | 0UL;
         unsigned long now = millis();
-        clientInfo[num].lastPongMs = now;
+        client.lastPongMs = now;
         if(sentTs != 0){
           unsigned long rtt = now - sentTs;
-          clientInfo[num].lastRttMs = rtt;
+          client.lastRttMs = rtt;
           // simple EMA for avg RTT
-          if(clientInfo[num].avgRttMs <= 0.1f) clientInfo[num].avgRttMs = (float)rtt;
-          else clientInfo[num].avgRttMs = (clientInfo[num].avgRttMs * 0.8f) + ((float)rtt * 0.2f);
-          clientInfo[num].lastRssi = WiFi.RSSI();
+          if(client.avgRttMs <= 0.1f) client.avgRttMs = (float)rtt;
+          else client.avgRttMs = (client.avgRttMs * 0.8f) + ((float)rtt * 0.2f);
+          client.lastRssi = WiFi.RSSI();
           // log if RTT or RSSI are poor
-          if(rtt > 500) Serial.printf("Client %d high RTT %lu ms RSSI %d\n", num, rtt, clientInfo[num].lastRssi);
-          if(clientInfo[num].lastRssi < -80) Serial.printf("Client %d low RSSI %d dBm\n", num, clientInfo[num].lastRssi);
+          if(rtt > 500) Serial.printf("Client %d high RTT %lu ms RSSI %d\n", num, rtt, client.lastRssi);
+          if(client.lastRssi < -80) Serial.printf("Client %d low RSSI %d dBm\n", num, client.lastRssi);
         }
       }
       return;
@@ -564,7 +557,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
     // handle flow-control ready request
     if(strcmp(t,"ready")==0){
-      if(num < MAX_WS_CLIENTS) client_ready[num] = true;
+      if(num == client_num) client_ready = true;
       return;
     }
   }
@@ -670,27 +663,24 @@ void handleRoot(){
 }
 
 void handleTelemetry(){
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(512);
   doc["type"] = "telemetry";
-  JsonArray arr = doc.createNestedArray("clients");
-  for(int i=0;i<MAX_WS_CLIENTS;i++){
-    JsonObject c = arr.createNestedObject();
-    c["idx"] = i;
-    c["connected"] = clientInfo[i].connected;
-    c["ip"] = clientInfo[i].ip.toString();
-    c["connectedAtMs"] = clientInfo[i].connectedAt;
-    c["lastFrameMs"] = clientInfo[i].lastFrameMs;
-    c["lastFrameBytes"] = (unsigned)clientInfo[i].lastFrameBytes;
-    c["framesSent"] = clientInfo[i].framesSent;
-    c["disconnects"] = clientInfo[i].disconnects;
-    c["sendAttempts"] = clientInfo[i].sendAttempts;
-    c["sendFailures"] = clientInfo[i].sendFailures;
-    c["lastRttMs"] = clientInfo[i].lastRttMs;
-    c["avgRttMs"] = clientInfo[i].avgRttMs;
-    c["lastRssi"] = clientInfo[i].lastRssi;
-    c["lastSendMs"] = clientInfo[i].lastSendMs;
-    c["lastPongMs"] = clientInfo[i].lastPongMs;
-  }
+  JsonObject c = doc.createNestedObject("client");
+  c["idx"] = client_num;
+  c["connected"] = client.connected;
+  c["ip"] = client.ip.toString();
+  c["connectedAtMs"] = client.connectedAt;
+  c["lastFrameMs"] = client.lastFrameMs;
+  c["lastFrameBytes"] = (unsigned)client.lastFrameBytes;
+  c["framesSent"] = client.framesSent;
+  c["disconnects"] = client.disconnects;
+  c["sendAttempts"] = client.sendAttempts;
+  c["sendFailures"] = client.sendFailures;
+  c["lastRttMs"] = client.lastRttMs;
+  c["avgRttMs"] = client.avgRttMs;
+  c["lastRssi"] = client.lastRssi;
+  c["lastSendMs"] = client.lastSendMs;
+  c["lastPongMs"] = client.lastPongMs;
   String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
@@ -768,25 +758,23 @@ void loop(){
   // Pop frames from queue and send via WebSocket (ALL WS ops on Core 0)
   camera_fb_t* fb = popFrameFromQueue();
   if (fb) {
-    // Send frame to all ready clients
-    for(uint8_t i=0; i<MAX_WS_CLIENTS; i++){
-      if(!client_ready[i]) continue;
-      if(millis() < clientInfo[i].backoffUntilMs) continue; // skip clients in backoff
-      IPAddress rip = webSocket.remoteIP(i);
-      if(rip == IPAddress((uint32_t)0)){
-        client_ready[i] = false;
-        continue;
+    // Send frame to client if ready
+    if(client_ready && millis() >= client.backoffUntilMs && client_num != 255){
+      IPAddress rip = webSocket.remoteIP(client_num);
+      if(rip != IPAddress((uint32_t)0)){
+        // send frame to client
+        client.sendAttempts++;
+        client.lastSendMs = millis();
+        client.pendingPrevFrameMs = client.lastFrameMs;
+        webSocket.sendBIN(client_num, fb->buf, fb->len);
+        client_ready = false;
+        // update telemetry (ack will be reflected when client sends ready and we update lastFrameMs)
+        client.framesSent++;
+        client.lastFrameMs = millis();
+        client.lastFrameBytes = fb->len;
+      } else {
+        client_ready = false;
       }
-      // send frame to this client
-      clientInfo[i].sendAttempts++;
-      clientInfo[i].lastSendMs = millis();
-      clientInfo[i].pendingPrevFrameMs = clientInfo[i].lastFrameMs;
-      webSocket.sendBIN(i, fb->buf, fb->len);
-      client_ready[i] = false;
-      // update telemetry (ack will be reflected when client sends ready and we update lastFrameMs)
-      clientInfo[i].framesSent++;
-      clientInfo[i].lastFrameMs = millis();
-      clientInfo[i].lastFrameBytes = fb->len;
     }
     esp_camera_fb_return(fb);
   }
@@ -802,21 +790,19 @@ void loop(){
     doc["fps"] = target_fps;
     doc["quality"] = current_jpeg_quality;
     doc["rssi"] = WiFi.RSSI();
-    // attach a small clients summary
-    JsonArray carr = doc.createNestedArray("clients");
-    for(int i=0;i<MAX_WS_CLIENTS;i++){
-      if(!clientInfo[i].connected) continue;
-      JsonObject c = carr.createNestedObject();
-      c["idx"] = i;
-      c["ip"] = clientInfo[i].ip.toString();
-      c["framesSent"] = clientInfo[i].framesSent;
-      c["lastFrameAgeMs"] = (unsigned long)(millis() - clientInfo[i].lastFrameMs);
-      c["lastFrameBytes"] = (unsigned)clientInfo[i].lastFrameBytes;
-      c["sendAttempts"] = clientInfo[i].sendAttempts;
-      c["sendFailures"] = clientInfo[i].sendFailures;
-      c["lastRttMs"] = clientInfo[i].lastRttMs;
-      c["avgRttMs"] = clientInfo[i].avgRttMs;
-      c["lastRssi"] = clientInfo[i].lastRssi;
+    // attach client summary if connected
+    if(client.connected){
+      JsonObject c = doc.createNestedObject("client");
+      c["idx"] = client_num;
+      c["ip"] = client.ip.toString();
+      c["framesSent"] = client.framesSent;
+      c["lastFrameAgeMs"] = (unsigned long)(millis() - client.lastFrameMs);
+      c["lastFrameBytes"] = (unsigned)client.lastFrameBytes;
+      c["sendAttempts"] = client.sendAttempts;
+      c["sendFailures"] = client.sendFailures;
+      c["lastRttMs"] = client.lastRttMs;
+      c["avgRttMs"] = client.avgRttMs;
+      c["lastRssi"] = client.lastRssi;
     }
     String out; serializeJson(doc, out);
     // broadcast status
@@ -828,49 +814,48 @@ void loop(){
     Serial.printf("CTRL X=%d Y=%d\n", ctrl_x, ctrl_y);
   }
 
-  // Application-level ping: send a lightweight ping JSON to clients and detect stale clients
+  // Application-level ping: send a lightweight ping JSON to client and detect stale client
   static unsigned long lastPing = 0;
   const unsigned long PING_INTERVAL_MS = 3000;
   const unsigned long PONG_TIMEOUT_MS = 10000;
   if(millis() - lastPing > PING_INTERVAL_MS){
     lastPing = millis();
-    for(int i=0;i<MAX_WS_CLIENTS;i++){
-      if(!clientInfo[i].connected) continue;
+    if(client.connected && client_num != 255){
       // send a small ping JSON with timestamp so client can echo it back
       char buf[64];
       unsigned long ts = millis();
       snprintf(buf, sizeof(buf), "{\"type\":\"ping\",\"ts\":%lu}", ts);
-      webSocket.sendTXT(i, buf);
+      webSocket.sendTXT(client_num, buf);
       // if we haven't seen a pong recently, mark as stale and stop sending to it
-      if(millis() - clientInfo[i].lastPongMs > PONG_TIMEOUT_MS){
-        Serial.printf("Client %d pong timeout, marking disconnected\n", i);
-        client_ready[i] = false;
-        clientInfo[i].connected = false;
-        clientInfo[i].disconnects++;
+      if(millis() - client.lastPongMs > PONG_TIMEOUT_MS){
+        Serial.printf("Client %d pong timeout, marking disconnected\n", client_num);
+        client_ready = false;
+        client.connected = false;
+        client.disconnects++;
+        client_num = 255;
       }
     }
   }
   // Check for sends that were not acknowledged (no frame progress) within timeout
   const unsigned long SEND_ACK_TIMEOUT_MS = 2000;
   const int SEND_FAILURE_DISCONNECT_THRESHOLD = 3;
-  for(int i=0;i<MAX_WS_CLIENTS;i++){
-    if(!clientInfo[i].connected) continue;
-    if(clientInfo[i].lastSendMs != 0){
-      if(millis() - clientInfo[i].lastSendMs > SEND_ACK_TIMEOUT_MS){
+  if(client.connected && client_num != 255){
+    if(client.lastSendMs != 0){
+      if(millis() - client.lastSendMs > SEND_ACK_TIMEOUT_MS){
         // if lastFrameMs hasn't advanced since before the send, consider it a failure
-        if(clientInfo[i].lastFrameMs == clientInfo[i].pendingPrevFrameMs){
-          clientInfo[i].sendFailures++;
-          Serial.printf("Client %d send failure #%d (no ack in %lums) lastRtt=%.1fms RSSI=%d\n", i, clientInfo[i].sendFailures, SEND_ACK_TIMEOUT_MS, clientInfo[i].avgRttMs, clientInfo[i].lastRssi);
+        if(client.lastFrameMs == client.pendingPrevFrameMs){
+          client.sendFailures++;
+          Serial.printf("Client %d send failure #%d (no ack in %lums) lastRtt=%.1fms RSSI=%d\n", client_num, client.sendFailures, SEND_ACK_TIMEOUT_MS, client.avgRttMs, client.lastRssi);
           // reset lastSendMs so we don't double count for the same send
-          clientInfo[i].lastSendMs = 0;
+          client.lastSendMs = 0;
           // if failures keep happening, mark client disconnected
-          if(clientInfo[i].sendFailures >= SEND_FAILURE_DISCONNECT_THRESHOLD){
-            Serial.printf("Client %d exceeded send failure threshold, applying backoff and reducing FPS\n", i);
+          if(client.sendFailures >= SEND_FAILURE_DISCONNECT_THRESHOLD){
+            Serial.printf("Client %d exceeded send failure threshold, applying backoff and reducing FPS\n", client_num);
             // apply a temporary backoff for this client (0.5s)
-            clientInfo[i].backoffUntilMs = millis() + 500; // 0.5s
-            client_ready[i] = false;
-            clientInfo[i].sendFailures = 0; // reset to avoid immediate repeat
-            clientInfo[i].disconnects++;
+            client.backoffUntilMs = millis() + 500; // 0.5s
+            client_ready = false;
+            client.sendFailures = 0; // reset to avoid immediate repeat
+            client.disconnects++;
             // resync camera: deinit and reinit to drop any pending frames/buffers
             Serial.println("Resyncing camera due to send failures");
             camera_reinit_in_progress = true;
@@ -888,7 +873,7 @@ void loop(){
               int old_fps = target_fps;
               target_fps = max(5, target_fps - 5);
               lastAutoThrottleMs = millis();
-              Serial.printf("Auto-throttle: target_fps %d -> %d due to client %d issues\n", old_fps, target_fps, i);
+              Serial.printf("Auto-throttle: target_fps %d -> %d due to client %d issues\n", old_fps, target_fps, client_num);
               DynamicJsonDocument doc(128);
               doc["type"] = "status";
               doc["resolution"] = desired_resolution;
@@ -899,20 +884,19 @@ void loop(){
           }
         } else {
           // client advanced, clear lastSendMs
-          clientInfo[i].lastSendMs = 0;
-          clientInfo[i].sendFailures = 0;
+          client.lastSendMs = 0;
+          client.sendFailures = 0;
         }
       }
     }
   }
-  // Additional auto-throttle: if any client shows sustained high RTT, reduce FPS and backoff
+  // Additional auto-throttle: if client shows sustained high RTT, reduce FPS and backoff
   const float RTT_THRESH_MS = 200.0f;
-  for(int i=0;i<MAX_WS_CLIENTS;i++){
-    if(!clientInfo[i].connected) continue;
-    if(clientInfo[i].avgRttMs > RTT_THRESH_MS){
-    Serial.printf("Client %d high avg RTT %.1fms — applying backoff and reducing FPS\n", i, clientInfo[i].avgRttMs);
-    clientInfo[i].backoffUntilMs = millis() + 500;
-      client_ready[i] = false;
+  if(client.connected && client_num != 255){
+    if(client.avgRttMs > RTT_THRESH_MS){
+    Serial.printf("Client %d high avg RTT %.1fms — applying backoff and reducing FPS\n", client_num, client.avgRttMs);
+    client.backoffUntilMs = millis() + 500;
+      client_ready = false;
       static unsigned long lastRttThrottleMs = 0;
       const unsigned long RTT_THROTTLE_COOLDOWN_MS = 5000;
       if(millis() - lastRttThrottleMs > RTT_THROTTLE_COOLDOWN_MS){
