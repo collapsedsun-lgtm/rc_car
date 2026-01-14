@@ -157,33 +157,33 @@ const char index_html[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="en">
 <head>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
   <meta charset="utf-8">
   <title>ESP32-CAM Stream</title>
   <style>
     html,body{height:100%;margin:0;font-family:Arial;background:#000;color:#fff}
-    #topbar{display:flex;gap:8px;padding:8px;background:rgba(0,0,0,0.4);align-items:center}
+    #topbar{display:flex;gap:8px;padding:6px 8px;background:rgba(0,0,0,0.35);align-items:center}
     select{font-size:16px;padding:6px}
     #status{margin-left:auto;font-size:14px}
-    #container{position:relative;display:flex;flex-direction:column;align-items:center}
-    #videoCanvas{background:#222;width:100%;max-width:960px;height:auto}
-    /* Left vertical slider */
-    #vslider{position:absolute;left:8px;top:56px;bottom:70px;width:44px;padding:0;transform:rotate(-90deg);transform-origin:top left}
-    /* Bottom horizontal slider */
-    #hslider{position:absolute;left:0;right:0;bottom:8px;margin:auto;width:90%;height:44px}
-    input[type=range]{-webkit-appearance:none;background:rgba(255,255,255,0.1);height:44px;border-radius:6px}
-    input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:36px;height:36px;border-radius:50%;background:#1e90ff}
-    #overlayVals{position:absolute;right:12px;top:56px;background:rgba(0,0,0,0.35);padding:6px;border-radius:6px}
-    @media (min-width:420px){#videoCanvas{height:360px}}
-    /* Joystick styles */
-    #joystick{position:absolute;right:12px;bottom:80px;width:160px;height:160px;border-radius:50%;touch-action:none;display:flex;align-items:center;justify-content:center}
-    #joy-bg{position:absolute;width:100%;height:100%;border-radius:50%;background:rgba(255,255,255,0.06);border:2px solid rgba(255,255,255,0.08)}
-    #joy-knob{position:absolute;width:56px;height:56px;border-radius:50%;background:rgba(30,144,255,0.95);box-shadow:0 2px 6px rgba(0,0,0,0.6);left:50%;top:50%;transform:translate(-50%,-50%)}
+    #container{position:relative; width:100%; height:calc(100% - 48px); overflow:hidden; display:flex; align-items:center; justify-content:center}
+    #videoCanvas{background:#111;width:100%;height:100%;max-width:1400px;object-fit:cover}
+
+    /* Left vertical throttle (large touch target) */
+    .vtrack{position:absolute;left:8px;top:56px;bottom:8px;width:84px;display:flex;align-items:center;justify-content:center;touch-action:none}
+    .vtrack .track{width:18px;height:80%;border-radius:12px;background:rgba(255,255,255,0.06);position:relative}
+    .vtrack .thumb{position:absolute;left:50%;transform:translateX(-50%);width:56px;height:56px;border-radius:50%;background:#1e90ff;box-shadow:0 3px 8px rgba(0,0,0,0.6)}
+
+    /* Bottom-right horizontal steering */
+    .htrack{position:absolute;right:8px;bottom:8px;width:44%;max-width:420px;height:84px;display:flex;align-items:center;justify-content:center;touch-action:none}
+    .htrack .track{height:18px;width:90%;border-radius:12px;background:rgba(255,255,255,0.06);position:relative}
+    .htrack .thumb{position:absolute;top:50%;transform:translateY(-50%);width:56px;height:56px;border-radius:50%;background:#ff7f50;box-shadow:0 3px 8px rgba(0,0,0,0.6)}
+
+    #overlayVals{position:absolute;left:110px;top:8px;background:rgba(0,0,0,0.35);padding:6px;border-radius:6px;font-size:15px}
+    @media (orientation:landscape){#videoCanvas{height:100%}}
   </style>
 </head>
 <body>
   <div id="topbar">
-}
     <label>Resolution: <select id="resSelect"><option value="480">480p</option><option value="320">320p</option><option value="296" selected>296p</option><option value="240">240p</option><option value="176">176p</option></select></label>
     <label>FPS: <select id="fpsSelect"></select></label>
     <label>Quality: <select id="qualitySelect"></select></label>
@@ -191,11 +191,18 @@ const char index_html[] PROGMEM = R"rawliteral(
   </div>
   <div id="container">
     <canvas id="videoCanvas"></canvas>
-    <div id="joystick" aria-label="joystick" role="application">
-      <div id="joy-bg"></div>
-      <div id="joy-knob"></div>
+
+    <div class="vtrack" id="vSlider" aria-label="throttle" role="slider">
+      <div class="track"></div>
+      <div class="thumb" id="vThumb"></div>
     </div>
-    <div id="overlayVals">X: <span id="xVal">128</span> Y: <span id="yVal">128</span></div>
+
+    <div class="htrack" id="hSlider" aria-label="steering" role="slider">
+      <div class="track"></div>
+      <div class="thumb" id="hThumb"></div>
+    </div>
+
+    <div id="overlayVals">Throttle: <span id="yVal">128</span> &nbsp; Steering: <span id="xVal">128</span></div>
   </div>
   <script>
     const status = document.getElementById('status');
@@ -203,19 +210,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     const ctx = canvas.getContext('2d');
     const resSelect = document.getElementById('resSelect');
     const fpsSelect = document.getElementById('fpsSelect');
-    const joystick = document.getElementById('joystick');
-    const joyBg = document.getElementById('joy-bg');
-    const joyKnob = document.getElementById('joy-knob');
+    const qualitySelect = document.getElementById('qualitySelect');
+
+    // Slider elements
+    const vSlider = document.getElementById('vSlider');
+    const vThumb = document.getElementById('vThumb');
+    const hSlider = document.getElementById('hSlider');
+    const hThumb = document.getElementById('hThumb');
     const xVal = document.getElementById('xVal');
     const yVal = document.getElementById('yVal');
 
     // Populate FPS options
     for(let i=1;i<=30;i++){const opt=document.createElement('option');opt.value=i;opt.text=i; if(i===15) opt.selected=true; fpsSelect.appendChild(opt)}
-    // Populate quality options (JPEG quality lower -> smaller image)
+    // Populate quality options
     const qualities = [10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90];
     for(const q of qualities){const opt=document.createElement('option');opt.value=q;opt.text=q; if(q===75) opt.selected=true; qualitySelect.appendChild(opt)}
 
-    // WebSocket to server (port 81 for frames & JSON)
+    // WebSocket
     let ws;
     function connect(){
       const loc = window.location.hostname;
@@ -223,49 +234,40 @@ const char index_html[] PROGMEM = R"rawliteral(
       ws.binaryType = 'arraybuffer';
       ws.onopen = ()=>{status.textContent='WS connected';sendConfig()};
       ws.onclose = ()=>{status.textContent='WS disconnected - reconnecting'; setTimeout(connect,100)};
-      ws.onerror = (e)=>{console.error(e);}
+      ws.onerror = (e)=>{console.error(e);} 
       ws.onmessage = async (evt)=>{
         if(typeof evt.data === 'string'){
-                        try{
-                                  const j=JSON.parse(evt.data);
-                                  if(j.type==='status'){
-                                    status.textContent = `res:${j.resolution} fps:${j.fps} q:${j.quality}`;
-                                    resSelect.value=j.resolution;
-                                    if(j.fps) fpsSelect.value = j.fps;
-                                    if(j.quality) qualitySelect.value = j.quality;
-                                  } else if(j.type==='ping'){
-                                    // respond with pong echoing server ts to allow RTT measurement
-                                    if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'pong', ts: j.ts || Date.now()}));
-                                  }
-                                }catch(e){}
-                return;
-              }
+          try{
+            const j=JSON.parse(evt.data);
+            if(j.type==='status'){
+              status.textContent = `res:${j.resolution} fps:${j.fps} q:${j.quality}`;
+              resSelect.value=j.resolution;
+              if(j.fps) fpsSelect.value = j.fps;
+              if(j.quality) qualitySelect.value = j.quality;
+            } else if(j.type==='ping'){
+              if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'pong', ts: j.ts || Date.now()}));
+            }
+          }catch(e){}
+          return;
+        }
         // Binary JPEG frame
-          const blob = new Blob([evt.data], {type:'image/jpeg'});
-          const img = await createImageBitmap(blob);
-          // COVER-scaling: upscale image to fill available container, preserve aspect ratio,
-          // and crop excess (top/bottom) to better fit typical phone horizontal screens.
-          const topbar = document.getElementById('topbar');
-          const topbarH = topbar ? topbar.offsetHeight : 56;
-          const containerWidth = Math.min(window.innerWidth, 960);
-          const containerHeight = Math.max(120, Math.floor((window.innerHeight - topbarH - 100)));
-
-          // determine scale to cover container (may crop on one axis)
-          const scale = Math.max(containerWidth / img.width, containerHeight / img.height);
-          const srcW = Math.round(containerWidth / scale);
-          const srcH = Math.round(containerHeight / scale);
-          const srcX = Math.round((img.width - srcW) / 2);
-          const srcY = Math.round((img.height - srcH) / 2);
-
-          canvas.width = containerWidth;
-          canvas.height = containerHeight;
-          // prefer higher-quality upscaling while keeping latency low
-          ctx.imageSmoothingEnabled = true;
-          try{ ctx.imageSmoothingQuality = 'high'; } catch(e){}
-          // draw cropped source to canvas (covers and fills)
-          ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, canvas.width*0.6, canvas.height*0.7);
-          // notify server we're ready for the next frame (flow-control)
-          if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ready'}));
+        const blob = new Blob([evt.data], {type:'image/jpeg'});
+        const img = await createImageBitmap(blob);
+        const topbar = document.getElementById('topbar');
+        const topbarH = topbar ? topbar.offsetHeight : 48;
+        const containerWidth = Math.min(window.innerWidth, 960);
+        const containerHeight = Math.max(120, Math.floor((window.innerHeight - topbarH - 8)));
+        const scale = Math.max(containerWidth / img.width, containerHeight / img.height);
+        const srcW = Math.round(containerWidth / scale);
+        const srcH = Math.round(containerHeight / scale);
+        const srcX = Math.round((img.width - srcW) / 2);
+        const srcY = Math.round((img.height - srcH) / 2);
+        canvas.width = containerWidth;
+        canvas.height = containerHeight;
+        ctx.imageSmoothingEnabled = true;
+        try{ ctx.imageSmoothingQuality = 'high'; } catch(e){}
+        ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, canvas.width, canvas.height);
+        if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ready'}));
       }
     }
 
@@ -274,75 +276,45 @@ const char index_html[] PROGMEM = R"rawliteral(
       if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify(cfg));
     }
 
-    // (old slider send functions removed — using joystick send instead)
-
-    // Wire events
     resSelect.addEventListener('change', sendConfig);
     fpsSelect.addEventListener('change', sendConfig);
-    // Virtual joystick implementation
-    let joyActive = false;
-    const JOY_SIZE = 160; // px
-    const JOY_RADIUS = JOY_SIZE/2;
-    let joyCenter = {x:0,y:0};
+    qualitySelect.addEventListener('change', sendConfig);
 
-    function setKnob(px, py){
-      joyKnob.style.transform = `translate(${px - (JOY_RADIUS)}px, ${py - (JOY_RADIUS)}px)`;
-    }
+    // Control state (0-255)
+    let ctrlX = 128, ctrlY = 128;
+    let pendingSend = false;
+    function scheduleSend(){ if(!pendingSend){ pendingSend=true; requestAnimationFrame(()=>{ if(ws && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:'ctrl', x: ctrlX, y: ctrlY})); pendingSend=false; }); }}
 
-    function sendJoy(x,y){
-      xVal.textContent = x;
-      yVal.textContent = y;
-      if(!ws || ws.readyState!==WebSocket.OPEN) return;
-      const msg = {type:'ctrl', x: x, y: y};
-      ws.send(JSON.stringify(msg));
-    }
+    // Pointer handling for vertical throttle
+    let vPointer = -1;
+    function vPointerDown(e){ e.preventDefault(); vSlider.setPointerCapture(e.pointerId); vPointer = e.pointerId; vPointerMove(e); }
+    function vPointerMove(e){ if(e.pointerId !== vPointer) return; const rect = vSlider.getBoundingClientRect(); const y = Math.max(rect.top, Math.min(rect.bottom, e.clientY)); const rel = 1 - ((y - rect.top) / rect.height); // 0..1, top=1
+      ctrlY = Math.round(rel * 255); yVal.textContent = ctrlY; // position thumb
+      const thumbCenter = rect.top + (1 - rel) * rect.height; vThumb.style.top = `${( (thumbCenter - rect.top) / rect.height) * 100}%`; scheduleSend(); }
+    function vPointerUp(e){ if(e.pointerId !== vPointer) return; try{ vSlider.releasePointerCapture(e.pointerId); }catch{} vPointer = -1; }
 
-    // Throttle using rAF
-    let pendingJoy = false;
-    function scheduleJoySend(x,y){ if(!pendingJoy){ pendingJoy=true; requestAnimationFrame(()=>{ sendJoy(x,y); pendingJoy=false; }); }}
+    // Pointer handling for horizontal steering
+    let hPointer = -1;
+    function hPointerDown(e){ e.preventDefault(); hSlider.setPointerCapture(e.pointerId); hPointer = e.pointerId; hPointerMove(e); }
+    function hPointerMove(e){ if(e.pointerId !== hPointer) return; const rect = hSlider.getBoundingClientRect(); const x = Math.max(rect.left, Math.min(rect.right, e.clientX)); const rel = (x - rect.left) / rect.width; ctrlX = Math.round(rel * 255); xVal.textContent = ctrlX; const thumbCenter = rect.left + rel * rect.width; hThumb.style.left = `${( (thumbCenter - rect.left) / rect.width) * 100}%`; scheduleSend(); }
+    function hPointerUp(e){ if(e.pointerId !== hPointer) return; try{ hSlider.releasePointerCapture(e.pointerId); }catch{} hPointer = -1; }
 
-    function handlePointerDown(e){
-      e.preventDefault();
-      joystick.setPointerCapture(e.pointerId);
-      joyActive = true;
-      const rect = joystick.getBoundingClientRect();
-      joyCenter = {x: rect.left + rect.width/2, y: rect.top + rect.height/2};
-      handlePointerMove(e);
-    }
-    function handlePointerMove(e){
-      if(!joyActive) return;
-      const dx = e.clientX - joyCenter.x;
-      const dy = e.clientY - joyCenter.y;
-      const dist = Math.hypot(dx,dy);
-      const max = JOY_RADIUS - 24; // keep knob inside
-      const scale = dist > max ? (max/dist) : 1;
-      const sx = dx * scale;
-      const sy = dy * scale;
-      // Map to 0-255 (center 128)
-      const outX = Math.round((sx / max) * 127 + 128);
-      const outY = Math.round((sy / max) * 127 + 128);
-      // move knob visually
-      const knobX = (sx + JOY_RADIUS);
-      const knobY = (sy + JOY_RADIUS);
-      setKnob(knobX, knobY);
-      scheduleJoySend(Math.max(0,Math.min(255,outX)), Math.max(0,Math.min(255,outY)));
-    }
-    function handlePointerUp(e){
-      try{ joystick.releasePointerCapture(e.pointerId); } catch(e){}
-      joyActive = false;
-      // return knob to center
-      setKnob(JOY_RADIUS, JOY_RADIUS);
-      scheduleJoySend(128,128);
-    }
+    // Initialize thumb positions
+    function updateThumbs(){ const vRect = vSlider.getBoundingClientRect(); vThumb.style.position='absolute'; vThumb.style.width='56px'; vThumb.style.height='56px'; vThumb.style.left='50%'; vThumb.style.top='50%'; const hRect = hSlider.getBoundingClientRect(); hThumb.style.position='absolute'; hThumb.style.width='56px'; hThumb.style.height='56px'; hThumb.style.top='50%'; hThumb.style.left='50%'; }
+    window.addEventListener('resize', ()=>{ setTimeout(updateThumbs,50); });
 
-    joystick.addEventListener('pointerdown', handlePointerDown);
-    joystick.addEventListener('pointermove', handlePointerMove);
-    joystick.addEventListener('pointerup', handlePointerUp);
-    joystick.addEventListener('pointercancel', handlePointerUp);
+    vSlider.addEventListener('pointerdown', vPointerDown);
+    vSlider.addEventListener('pointermove', vPointerMove);
+    vSlider.addEventListener('pointerup', vPointerUp);
+    vSlider.addEventListener('pointercancel', vPointerUp);
 
-    // initialize joystick knob to center
-    setKnob(JOY_RADIUS, JOY_RADIUS);
-    // Start
+    hSlider.addEventListener('pointerdown', hPointerDown);
+    hSlider.addEventListener('pointermove', hPointerMove);
+    hSlider.addEventListener('pointerup', hPointerUp);
+    hSlider.addEventListener('pointercancel', hPointerUp);
+
+    // set defaults and start
+    xVal.textContent = ctrlX; yVal.textContent = ctrlY; setTimeout(updateThumbs,100);
     connect();
   </script>
 </body>
