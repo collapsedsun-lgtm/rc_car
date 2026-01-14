@@ -40,6 +40,52 @@ WebSocketsServer webSocket = WebSocketsServer(81);
 #define MAX_WS_CLIENTS 6
 volatile bool client_ready[MAX_WS_CLIENTS] = {false};
 
+// Frame queue: captureTask pushes frames, main loop pops and sends via WebSocket
+// Since single-client constraint, use simple circular buffer to avoid heap allocations
+#define FRAME_QUEUE_SIZE 3
+struct FrameQueueEntry {
+  camera_fb_t* fb;
+  bool valid;
+};
+volatile FrameQueueEntry frame_queue[FRAME_QUEUE_SIZE];
+volatile int frame_queue_head = 0;
+volatile int frame_queue_tail = 0;
+portMUX_TYPE frame_queue_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// Push frame to queue (called from captureTask, Core 1)
+bool pushFrameToQueue(camera_fb_t* fb) {
+  taskENTER_CRITICAL(&frame_queue_mux);
+  int next_head = (frame_queue_head + 1) % FRAME_QUEUE_SIZE;
+  if (next_head == frame_queue_tail) {
+    // Queue full, return old frame and reject new one
+    if (frame_queue[frame_queue_head].valid && frame_queue[frame_queue_head].fb) {
+      esp_camera_fb_return(frame_queue[frame_queue_head].fb);
+    }
+    taskEXIT_CRITICAL(&frame_queue_mux);
+    return false;
+  }
+  frame_queue[frame_queue_head].fb = fb;
+  frame_queue[frame_queue_head].valid = true;
+  frame_queue_head = next_head;
+  taskEXIT_CRITICAL(&frame_queue_mux);
+  return true;
+}
+
+// Pop frame from queue (called from main loop, Core 0)
+camera_fb_t* popFrameFromQueue() {
+  taskENTER_CRITICAL(&frame_queue_mux);
+  if (frame_queue_tail == frame_queue_head) {
+    taskEXIT_CRITICAL(&frame_queue_mux);
+    return NULL; // Queue empty
+  }
+  camera_fb_t* fb = frame_queue[frame_queue_tail].fb;
+  frame_queue[frame_queue_tail].valid = false;
+  frame_queue[frame_queue_tail].fb = NULL;
+  frame_queue_tail = (frame_queue_tail + 1) % FRAME_QUEUE_SIZE;
+  taskEXIT_CRITICAL(&frame_queue_mux);
+  return fb;
+}
+
 // Per-client telemetry
 struct ClientInfo {
   bool connected = false;
@@ -66,12 +112,12 @@ ClientInfo clientInfo[MAX_WS_CLIENTS];
 // Default settings
 volatile int target_fps = 15; // default fps
 volatile int current_fps = 15;
-volatile int desired_resolution = 240; // 120/240/360
+volatile int desired_resolution = 176; // 120/240/360
   // Adaptive streaming parameters
-  int current_jpeg_quality = 18;
-  const int MIN_JPEG_QUALITY = 8;
-  const int MAX_JPEG_QUALITY = 30;
-  const size_t MAX_FRAME_BYTES = 40000; // if frames larger than this, consider lowering quality or skipping
+  int current_jpeg_quality = 12; // lower -> higher quality
+  const int MIN_JPEG_QUALITY = 10;
+  const int MAX_JPEG_QUALITY = 98;
+  const size_t MAX_FRAME_BYTES = 100000; // if frames larger than this, consider lowering quality or skipping
   int consecutive_large_frames = 0;
   const int LARGE_FRAME_THRESHOLD = 6; // after this many large frames, reduce fps
 // Flag to pause capture while camera is being reconfigured
@@ -82,13 +128,16 @@ volatile int ctrl_x = 128;
 volatile int ctrl_y = 128;
 
 // Motor & servo pins (change as needed). Choose pins that do not conflict with camera.
-#define MOTOR_PWM_PIN 12
-#define MOTOR_DIR_PIN 13
-#define SERVO_PIN 14
+#define MOTOR_PWM_F_PIN 12
+#define MOTOR_PWM_R_PIN 13
+#define SERVO_L_PIN 14
+#define SERVO_R_PIN 15
 
 // LEDC channels for PWM
-#define MOTOR_LEDC_CH 0
-#define SERVO_LEDC_CH 1
+#define MOTOR_F_LEDC_CH 0
+#define MOTOR_R_LEDC_CH 1
+#define SERVO_L_LEDC_CH 2
+#define SERVO_R_LEDC_CH 3
 
 // Motor settings
 const int MOTOR_PWM_FREQ = 5000; // Hz
@@ -134,7 +183,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head>
 <body>
   <div id="topbar">
-    <label>Resolution: <select id="resSelect"><option value="360">360p</option><option value="240" selected>240p</option><option value="120">120p</option></select></label>
+}
+    <label>Resolution: <select id="resSelect"><option value="480">480p</option><option value="320">320p</option><option value="296" selected>296p</option><option value="240">240p</option><option value="176">176p</option></select></label>
     <label>FPS: <select id="fpsSelect"></select></label>
     <label>Quality: <select id="qualitySelect"></select></label>
     <div id="status">Connecting...</div>
@@ -162,8 +212,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     // Populate FPS options
     for(let i=1;i<=30;i++){const opt=document.createElement('option');opt.value=i;opt.text=i; if(i===15) opt.selected=true; fpsSelect.appendChild(opt)}
     // Populate quality options (JPEG quality lower -> smaller image)
-    const qualities = [8,10,12,14,16,18,20,22,24,26,28,30];
-    for(const q of qualities){const opt=document.createElement('option');opt.value=q;opt.text=q; if(q===18) opt.selected=true; qualitySelect.appendChild(opt)}
+    const qualities = [10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90];
+    for(const q of qualities){const opt=document.createElement('option');opt.value=q;opt.text=q; if(q===75) opt.selected=true; qualitySelect.appendChild(opt)}
 
     // WebSocket to server (port 81 for frames & JSON)
     let ws;
@@ -197,8 +247,8 @@ const char index_html[] PROGMEM = R"rawliteral(
           // and crop excess (top/bottom) to better fit typical phone horizontal screens.
           const topbar = document.getElementById('topbar');
           const topbarH = topbar ? topbar.offsetHeight : 56;
-          const containerWidth = Math.min(window.innerWidth * 0.9, 960);
-          const containerHeight = Math.max(120, Math.floor((window.innerHeight - topbarH - 100)) * 0.9 );
+          const containerWidth = Math.min(window.innerWidth, 960);
+          const containerHeight = Math.max(120, Math.floor((window.innerHeight - topbarH - 100)));
 
           // determine scale to cover container (may crop on one axis)
           const scale = Math.max(containerWidth / img.width, containerHeight / img.height);
@@ -213,7 +263,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           ctx.imageSmoothingEnabled = true;
           try{ ctx.imageSmoothingQuality = 'high'; } catch(e){}
           // draw cropped source to canvas (covers and fills)
-          ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, canvas.width*0.6, canvas.height*0.7);
           // notify server we're ready for the next frame (flow-control)
           if(ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ready'}));
       }
@@ -236,7 +286,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     let joyCenter = {x:0,y:0};
 
     function setKnob(px, py){
-      joyKnob.style.transform = `translate(${px - (2 * JOY_RADIUS)}px, ${py - (2 * JOY_RADIUS)}px)`;
+      joyKnob.style.transform = `translate(${px - (JOY_RADIUS)}px, ${py - (JOY_RADIUS)}px)`;
     }
 
     function sendJoy(x,y){
@@ -301,10 +351,13 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 // Helpers for camera mapping
 static framesize_t map_resolution_to_framesize(int res) {
-  if (res == 120) return FRAMESIZE_QQVGA; // 160x120
+
+  if (res == 176) return FRAMESIZE_HQVGA; // 240x176
   if (res == 240) return FRAMESIZE_QVGA;  // 320x240
-  // 360p is not a native camera framesize; use VGA (640x480) as fallback and document client-side scaling
-  return FRAMESIZE_VGA; // fallback for 360p
+  if (res == 296) return FRAMESIZE_CIF;  // 400x296
+  if (res == 320) return FRAMESIZE_HVGA;  // 480x320
+  if (res == 480) return FRAMESIZE_VGA;  // 640x480
+  return FRAMESIZE_CIF; // fallback for 296p
 }
 
 camera_config_t camera_config(){
@@ -352,9 +405,10 @@ bool initCameraForResolution(int res) {
   // record current
   current_fps = target_fps;
   Serial.printf("Camera initialized at framesize %d for requested %dp\n", (int)fs, res);
-  if (res == 360) {
-    Serial.println("Note: 360p is not natively supported; using 640x480 fallback. Client will crop/scale to 360p.");
-  }
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_ae_level(s, 2); // adjust ae level if needed
+  s->set_exposure_ctrl(s, 1); // adjust exposure level if needed
+
   return true;
 }
 
@@ -493,20 +547,20 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             camera_reinit_in_progress = false;
       }
         // apply quality change if present
-        int quality = doc["quality"] | current_jpeg_quality;
-        if(quality != current_jpeg_quality){
-              current_jpeg_quality = quality;
-              Serial.printf("Applied quality change: current_jpeg_quality=%d\n", current_jpeg_quality);
-          sensor_t * s = esp_camera_sensor_get();
-          if(s && s->set_quality) s->set_quality(s, current_jpeg_quality);
-          DynamicJsonDocument qd(128);
-          qd["type"] = "status";
-          qd["resolution"] = desired_resolution;
-          qd["fps"] = target_fps;
-          qd["quality"] = current_jpeg_quality;
-          String qs; serializeJson(qd, qs);
-          webSocket.broadcastTXT(qs);
-        }
+        // int quality = doc["quality"] | current_jpeg_quality;
+        // if(quality != current_jpeg_quality){
+        //       current_jpeg_quality = quality;
+        //       Serial.printf("Applied quality change: current_jpeg_quality=%d\n", current_jpeg_quality);
+        //   sensor_t * s = esp_camera_sensor_get();
+        //   if(s && s->set_quality) s->set_quality(s, current_jpeg_quality);
+        //   DynamicJsonDocument qd(128);
+        //   qd["type"] = "status";
+        //   qd["resolution"] = desired_resolution;
+        //   qd["fps"] = target_fps;
+        //   qd["quality"] = current_jpeg_quality;
+        //   String qs; serializeJson(qd, qs);
+        //   webSocket.broadcastTXT(qs);
+        // }
     }
     // handle flow-control ready request
     if(strcmp(t,"ready")==0){
@@ -522,8 +576,8 @@ void captureTask(void *pvParameters){
     int fps = target_fps > 0 ? target_fps : 1;
     unsigned long start = millis();
 
-    // only capture if at least one client connected and not reinitializing camera
-    if(webSocket.connectedClients() > 0 && !camera_reinit_in_progress){
+    // only capture if not reinitializing camera
+    if(!camera_reinit_in_progress){
       camera_fb_t * fb = esp_camera_fb_get();
       if(!fb){
         Serial.println("Camera capture failed");
@@ -535,53 +589,33 @@ void captureTask(void *pvParameters){
           // oversized frame: count and try to reduce quality dynamically
           consecutive_large_frames++;
           sensor_t * s = esp_camera_sensor_get();
-          if(s && current_jpeg_quality > MIN_JPEG_QUALITY){
-            current_jpeg_quality = max(MIN_JPEG_QUALITY, current_jpeg_quality - 2);
+          if(s) {
+            current_jpeg_quality = min(MIN_JPEG_QUALITY, max(MIN_JPEG_QUALITY, current_jpeg_quality));
             Serial.printf("Adjusting JPEG quality down to %d\n", current_jpeg_quality);
             if(s->set_quality) s->set_quality(s, current_jpeg_quality);
           }
           esp_camera_fb_return(fb);
         } else {
           consecutive_large_frames = 0;
-          // per-client flow-controlled send: only send to clients that signalled ready
-          for(uint8_t i=0; i<MAX_WS_CLIENTS; i++){
-            if(!client_ready[i]) continue;
-            if(millis() < clientInfo[i].backoffUntilMs) continue; // skip clients in backoff
-            IPAddress rip = webSocket.remoteIP(i);
-            if(rip == IPAddress((uint32_t)0)){
-              client_ready[i] = false;
-              continue;
-            }
-            // send frame to this client
-            clientInfo[i].sendAttempts++;
-            clientInfo[i].lastSendMs = millis();
-            clientInfo[i].pendingPrevFrameMs = clientInfo[i].lastFrameMs;
-            webSocket.sendBIN(i, fb->buf, fb->len);
-            client_ready[i] = false;
-            // update telemetry (ack will be reflected when client sends ready and we update lastFrameMs)
-            clientInfo[i].framesSent++;
-            clientInfo[i].lastFrameMs = millis();
-            clientInfo[i].lastFrameBytes = fb->len;
+          // Push frame to queue; main loop will send it via WebSocket
+          // This avoids calling WebSocket from multiple threads (thread safety issue)
+          bool queued = pushFrameToQueue(fb);
+          if (!queued) {
+            Serial.println("Frame queue full, dropping frame");
+            esp_camera_fb_return(fb);
           }
-          esp_camera_fb_return(fb);
         }
 
         // small yield so other tasks (websocket loop) can run
         vTaskDelay(1 / portTICK_PERIOD_MS);
 
         // if we observed many consecutive large frames, reduce FPS to ease load
+        // Note: FPS reduction will be handled by main loop instead
         if(consecutive_large_frames >= LARGE_FRAME_THRESHOLD){
-          int old_fps = target_fps;
-          target_fps = max(5, target_fps - 5);
-          Serial.printf("High bandwidth detected; reducing target_fps %d -> %d\n", old_fps, target_fps);
           consecutive_large_frames = 0;
-          // notify clients of new fps
-          DynamicJsonDocument doc(128);
-          doc["type"] = "status";
-          doc["resolution"] = desired_resolution;
-          doc["fps"] = target_fps;
-          String out; serializeJson(doc, out);
-          webSocket.broadcastTXT(out);
+          // Signal to main loop to reduce FPS (via global variable)
+          target_fps = max(5, target_fps - 5);
+          Serial.printf("High bandwidth detected; reducing target_fps to %d\n", target_fps);
         }
       }
     }
@@ -601,18 +635,32 @@ void applyControlOutputs(){
   // Motor: direction pin + PWM speed
   if (abs(y - 128) <= MOTOR_DEADBAND) {
     // in deadband -> stop motor
-    ledcWrite(MOTOR_LEDC_CH, 0);
+    ledcWrite(MOTOR_F_LEDC_CH, 0);
+    ledcWrite(MOTOR_R_LEDC_CH, 0);
   } else {
-    if (y > 128) digitalWrite(MOTOR_DIR_PIN, HIGH); else digitalWrite(MOTOR_DIR_PIN, LOW);
-    int speed = map(abs(y - 128), 0, 127, 0, 255);
-    ledcWrite(MOTOR_LEDC_CH, speed);
+    if (y > 128)
+      {
+        // forward
+        ledcWrite(MOTOR_F_LEDC_CH, map(abs(y - 128), 0, 127, 0, 255));
+        ledcWrite(MOTOR_R_LEDC_CH, 0);
+      }
+    else
+      {
+        // reverse
+        ledcWrite(MOTOR_F_LEDC_CH, 0);
+        ledcWrite(MOTOR_R_LEDC_CH, map(abs(128 - y), 0, 127, 0, 255));
+      }
   }
 
   // Servo: map x (0-255) to pulse width (SERVO_MIN_US..SERVO_MAX_US)
-  int pulse_us = map(x, 0, 255, SERVO_MIN_US, SERVO_MAX_US);
-  uint32_t max_duty = ((1UL << SERVO_RES) - 1UL);
-  uint32_t duty = (uint64_t)pulse_us * max_duty / 20000UL; // 20ms period
-  ledcWrite(SERVO_LEDC_CH, duty);
+  int pulse_us_l = map(x, 0, 255, SERVO_MIN_US, SERVO_MAX_US);
+  int pulse_us_r = map(x, 0, 255, SERVO_MIN_US, SERVO_MAX_US);
+  uint32_t max_duty_l = ((1UL << SERVO_RES) - 1UL);
+  uint32_t duty_l = (uint64_t)pulse_us_l * max_duty_l / 20000UL; // 20ms period
+  uint32_t max_duty_r = ((1UL << SERVO_RES) - 1UL);
+  uint32_t duty_r = (uint64_t)pulse_us_r * max_duty_r / 20000UL; // 20ms period
+  ledcWrite(SERVO_L_LEDC_CH, duty_l);
+  ledcWrite(SERVO_R_LEDC_CH, duty_r);
 }
 
 void handleRoot(){
@@ -691,14 +739,16 @@ void setup(){
   }
 
   // Configure motor PWM and direction pin
-  pinMode(MOTOR_DIR_PIN, OUTPUT);
-  digitalWrite(MOTOR_DIR_PIN, LOW);
-  ledcSetup(MOTOR_LEDC_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
-  ledcAttachPin(MOTOR_PWM_PIN, MOTOR_LEDC_CH);
+  ledcSetup(MOTOR_F_LEDC_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcAttachPin(MOTOR_PWM_F_PIN, MOTOR_F_LEDC_CH);
+  ledcSetup(MOTOR_R_LEDC_CH, MOTOR_PWM_FREQ, MOTOR_PWM_RES);
+  ledcAttachPin(MOTOR_PWM_R_PIN, MOTOR_R_LEDC_CH);
 
   // Configure servo PWM
-  ledcSetup(SERVO_LEDC_CH, SERVO_FREQ, SERVO_RES);
-  ledcAttachPin(SERVO_PIN, SERVO_LEDC_CH);
+  ledcSetup(SERVO_L_LEDC_CH, SERVO_FREQ, SERVO_RES);
+  ledcSetup(SERVO_R_LEDC_CH, SERVO_FREQ, SERVO_RES);
+  ledcAttachPin(SERVO_L_PIN, SERVO_L_LEDC_CH);
+  ledcAttachPin(SERVO_R_PIN, SERVO_R_LEDC_CH);
 
   // Ensure centered defaults and apply to outputs
   ctrl_x = 128;
@@ -714,6 +764,33 @@ void loop(){
   server.handleClient();
   // WebSocket background loop (required for arduinoWebSockets)
   webSocket.loop();
+
+  // Pop frames from queue and send via WebSocket (ALL WS ops on Core 0)
+  camera_fb_t* fb = popFrameFromQueue();
+  if (fb) {
+    // Send frame to all ready clients
+    for(uint8_t i=0; i<MAX_WS_CLIENTS; i++){
+      if(!client_ready[i]) continue;
+      if(millis() < clientInfo[i].backoffUntilMs) continue; // skip clients in backoff
+      IPAddress rip = webSocket.remoteIP(i);
+      if(rip == IPAddress((uint32_t)0)){
+        client_ready[i] = false;
+        continue;
+      }
+      // send frame to this client
+      clientInfo[i].sendAttempts++;
+      clientInfo[i].lastSendMs = millis();
+      clientInfo[i].pendingPrevFrameMs = clientInfo[i].lastFrameMs;
+      webSocket.sendBIN(i, fb->buf, fb->len);
+      client_ready[i] = false;
+      // update telemetry (ack will be reflected when client sends ready and we update lastFrameMs)
+      clientInfo[i].framesSent++;
+      clientInfo[i].lastFrameMs = millis();
+      clientInfo[i].lastFrameBytes = fb->len;
+    }
+    esp_camera_fb_return(fb);
+  }
+
   // update status periodically
   static unsigned long last = 0;
   static unsigned long lastCtrlPrint = 0;
