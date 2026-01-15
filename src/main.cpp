@@ -128,8 +128,8 @@ volatile int ctrl_x = 128;
 volatile int ctrl_y = 128;
 
 // Motor & servo pins (change as needed). Choose pins that do not conflict with camera.
-#define MOTOR_PWM_F_PIN 12
-#define MOTOR_PWM_R_PIN 13
+#define MOTOR_PWM_F_PIN 13
+#define MOTOR_PWM_R_PIN 12
 #define SERVO_L_PIN 14
 #define SERVO_R_PIN 15
 
@@ -161,12 +161,13 @@ const char index_html[] PROGMEM = R"rawliteral(
   <meta charset="utf-8">
   <title>ESP32-CAM Stream</title>
   <style>
-    html,body{height:100%;margin:0;font-family:Arial;background:#000;color:#fff}
-    #topbar{display:flex;gap:8px;padding:6px 8px;background:rgba(0,0,0,0.35);align-items:center}
+    html,body{height:100%;margin:0;font-family:Arial;background:#000;color:#fff;overflow:hidden}
+    /* topbar overlays the video so container can be full-viewport */
+    #topbar{position:absolute;top:0;left:0;right:0;z-index:30;display:flex;gap:8px;padding:6px 8px;background:rgba(0,0,0,0.25);align-items:center}
     select{font-size:16px;padding:6px}
     #status{margin-left:auto;font-size:14px}
-    #container{position:relative; width:100%; height:calc(100% - 48px); overflow:hidden; display:flex; align-items:center; justify-content:center}
-    #videoCanvas{background:#111;width:100%;height:100%;max-width:1400px;object-fit:cover}
+    #container{position:absolute;top:48px;left:0;right:0;bottom:0;overflow:hidden;display:flex;align-items:center;justify-content:center}
+    #videoCanvas{background:#111;width:100%;height:100%;max-width:none;object-fit:cover}
 
     /* Left vertical throttle (large touch target) */
     .vtrack{position:absolute;left:8px;top:56px;bottom:8px;width:84px;display:flex;align-items:center;justify-content:center;touch-action:none}
@@ -188,6 +189,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     <label>FPS: <select id="fpsSelect"></select></label>
     <label>Quality: <select id="qualitySelect"></select></label>
     <div id="status">Connecting...</div>
+    <button id="fsBtn" style="margin-left:8px;padding:6px 10px;font-size:14px">Full</button>
   </div>
   <div id="container">
     <canvas id="videoCanvas"></canvas>
@@ -299,8 +301,45 @@ const char index_html[] PROGMEM = R"rawliteral(
     function hPointerMove(e){ if(e.pointerId !== hPointer) return; const rect = hSlider.getBoundingClientRect(); const x = Math.max(rect.left, Math.min(rect.right, e.clientX)); const rel = (x - rect.left) / rect.width; ctrlX = Math.round(rel * 255); xVal.textContent = ctrlX; const thumbCenter = rect.left + rel * rect.width; hThumb.style.left = `${( (thumbCenter - rect.left) / rect.width) * 100}%`; scheduleSend(); }
     function hPointerUp(e){ if(e.pointerId !== hPointer) return; try{ hSlider.releasePointerCapture(e.pointerId); }catch{} hPointer = -1; }
 
-    // Initialize thumb positions
-    function updateThumbs(){ const vRect = vSlider.getBoundingClientRect(); vThumb.style.position='absolute'; vThumb.style.width='56px'; vThumb.style.height='56px'; vThumb.style.left='50%'; vThumb.style.top='50%'; const hRect = hSlider.getBoundingClientRect(); hThumb.style.position='absolute'; hThumb.style.width='56px'; hThumb.style.height='56px'; hThumb.style.top='50%'; hThumb.style.left='50%'; }
+    // Initialize thumb positions and layout based on actual topbar height
+    function updateThumbs(){
+      const topbarEl = document.getElementById('topbar');
+      const container = document.getElementById('container');
+      const topH = topbarEl ? topbarEl.offsetHeight : 48;
+      // ensure container sits below topbar
+      container.style.top = topH + 'px';
+
+      // vertical slider: position from topbar height
+      vSlider.style.position = 'absolute';
+      vSlider.style.top = (topH + 8) + 'px';
+      vSlider.style.bottom = '8px';
+      // horizontal slider sits at bottom: keep CSS bottom:8px
+      hSlider.style.position = 'absolute';
+      hSlider.style.right = '8px';
+
+      // Size and position thumbs according to current control values
+      vThumb.style.position = 'absolute';
+      vThumb.style.width = '56px';
+      vThumb.style.height = '56px';
+      vThumb.style.left = '50%';
+      const vRect = vSlider.getBoundingClientRect();
+      if(vRect.height > 0){
+        const rel = ctrlY / 255; // 0..1
+        const topPct = (1 - rel) * 100; // convert to percentage where 0% is top of track
+        vThumb.style.top = topPct + '%';
+      }
+
+      hThumb.style.position = 'absolute';
+      hThumb.style.width = '56px';
+      hThumb.style.height = '56px';
+      hThumb.style.top = '50%';
+      const hRect = hSlider.getBoundingClientRect();
+      if(hRect.width > 0){
+        const relx = ctrlX / 255; // 0..1
+        const leftPct = relx * 100;
+        hThumb.style.left = leftPct + '%';
+      }
+    }
     window.addEventListener('resize', ()=>{ setTimeout(updateThumbs,50); });
 
     vSlider.addEventListener('pointerdown', vPointerDown);
@@ -315,6 +354,23 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     // set defaults and start
     xVal.textContent = ctrlX; yVal.textContent = ctrlY; setTimeout(updateThumbs,100);
+    // Fullscreen button handler
+    try{
+      const fsBtn = document.getElementById('fsBtn');
+      if(fsBtn){
+        fsBtn.addEventListener('click', async ()=>{
+          try{
+            if(document.fullscreenElement){
+              await document.exitFullscreen();
+            } else {
+              await document.documentElement.requestFullscreen();
+              try{ if(screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape'); } catch(e){}
+            }
+          }catch(e){}
+          setTimeout(updateThumbs,100);
+        });
+      }
+    }catch(e){}
     connect();
   </script>
 </body>
